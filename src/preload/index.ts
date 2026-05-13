@@ -53,6 +53,14 @@ const api = {
 
   workspaceServerPort: (): Promise<number> => ipcRenderer.invoke('workspace:server-port'),
 
+  selectFolder: (): Promise<string | null> => ipcRenderer.invoke('workspace:select-folder'),
+
+  setCustomPath: (conversationId: string, folderPath: string): Promise<{ path: string; previewUrl: string } | { error: string }> => 
+    ipcRenderer.invoke('workspace:set-custom-path', { conversationId, folderPath }),
+
+  getCustomPath: (conversationId: string): Promise<string | null> => 
+    ipcRenderer.invoke('workspace:get-custom-path', conversationId),
+
   onWorkspaceChanged: (cb: (ev: { conversationId: string }) => void): (() => void) => {
     const listener = (_: IpcRendererEvent, ev: { conversationId: string }): void => cb(ev)
     ipcRenderer.on('workspace:changed', listener)

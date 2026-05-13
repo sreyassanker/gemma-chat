@@ -1,5 +1,9 @@
-import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage } from 'electron'
+import { thermalChatStream, calibrateThermal } from './thermal-loop'
+import { runSwarm } from './swarm'
+import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage, dialog } from 'electron'
 import { join } from 'path'
+import { existsSync } from 'fs'
+import { mkdir, writeFile, readFile } from 'fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { AVAILABLE_MODELS } from '@shared/types'
 import {
@@ -7,8 +11,6 @@ import {
   installMLX,
   startServer,
   stopServer,
-  hasModel,
-  chatStream,
   listLocalModels,
   type MLXChatMessage
 } from './mlx'
@@ -253,7 +255,29 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
         }
       }
 
-      streamLoop: for await (const chunk of chatStream({
+      // Decide: simple local chat or hybrid swarm?
+      const useSwarm = req.enableTools && req.mode === 'chat' && req.messages.length <= 2
+
+      if (useSwarm && process.env.OPENROUTER_API_KEY) {
+        // Hybrid swarm: cloud plans, local executes
+        const result = await runSwarm(
+          req.messages[req.messages.length - 1].content,
+          (msgs) => thermalChatStream({
+            model: req.model,
+            messages: [...baseMessages, ...msgs],
+            signal: abort.signal
+          }),
+          ctx
+        )
+        
+        // Emit swarm results
+        emit({ type: 'token', text: result.review })
+        emit({ type: 'done' })
+        return
+      }
+
+      // Standard thermal-paced local inference
+      streamLoop: for await (const chunk of thermalChatStream({
         model: req.model,
         messages: baseMessages,
         signal: abort.signal
@@ -562,7 +586,48 @@ app.whenReady().then(async () => {
     }
   )
 
+  ipcMain.handle('workspace:select-folder', async () => {
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      properties: ['openDirectory', 'createDirectory'],
+      buttonLabel: 'Select Project Folder',
+      defaultPath: app.getPath('documents')
+    })
+    return result.canceled ? null : result.filePaths[0]
+  })
+
+  ipcMain.handle('workspace:set-custom-path', async (_e, { conversationId, folderPath }: { conversationId: string; folderPath: string }) => {
+    if (!existsSync(folderPath)) return { error: 'Path does not exist' }
+    
+    const metaDir = join(app.getPath('userData'), 'conversations')
+    await mkdir(metaDir, { recursive: true })
+    const metaPath = join(metaDir, `${conversationId}.json`)
+    await writeFile(metaPath, JSON.stringify({ customPath: folderPath, createdAt: Date.now() }))
+    
+    return { path: folderPath, previewUrl: `http://127.0.0.1:${await getWorkspaceServerPort()}/${conversationId}` }
+  })
+
+  ipcMain.handle('workspace:get-custom-path', async (_e, conversationId: string) => {
+    try {
+      const metaPath = join(app.getPath('userData'), 'conversations', `${conversationId}.json`)
+      const data = JSON.parse(await readFile(metaPath, 'utf-8'))
+      return data.customPath || null
+    } catch {
+      return null
+    }
+  })
+
   createWindow()
+
+  // Calibrate thermal loop once MLX is ready
+  app.on('browser-window-created', async (_, _window) => {
+    // Wait for first setup then calibrate
+    setTimeout(async () => {
+      const mlx = locateMLX()
+      if (mlx?.installed && mlxPython) {
+        await calibrateThermal(mlxPython)
+      }
+    }, 30000) // 30s after window opens
+  })
 
   app.on('activate', function () {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

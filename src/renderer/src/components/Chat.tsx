@@ -245,6 +245,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
             onToggleMode={toggleMode}
             onToggleCanvas={toggleCanvas}
             onSwitchModel={onSwitchModel}
+            conversationId={activeId}
           />
           <MessageList
             messages={activeConversation.messages}
@@ -338,7 +339,8 @@ function Header({
   canvasOpen,
   onToggleMode,
   onToggleCanvas,
-  onSwitchModel
+  onSwitchModel,
+  conversationId
 }: {
   model: string
   mode: AgentMode
@@ -346,9 +348,16 @@ function Header({
   onToggleMode: () => void
   onToggleCanvas: () => void
   onSwitchModel: (model: string) => void
+  conversationId: string
 }) {
+  const [projectPath, setProjectPath] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const pickerRef = useRef<HTMLDivElement>(null)
+
+  // Load saved path on mount
+  useEffect(() => {
+    window.api.getCustomPath?.(conversationId).then(setProjectPath)
+  }, [conversationId])
 
   // Close dropdown on outside click
   useEffect(() => {
@@ -376,6 +385,23 @@ function Header({
         </ModePill>
       </div>
       <div className="no-drag flex shrink-0 items-center justify-end gap-2">
+        <button
+          onClick={async () => {
+            const folder = await window.api.selectFolder()
+            if (folder) {
+              await window.api.setCustomPath(conversationId, folder)
+              setProjectPath(folder)
+            }
+          }}
+          title={projectPath || 'Select project folder'}
+          className="flex items-center gap-1.5 whitespace-nowrap rounded-md border border-[#333] bg-[#1f1f1f] px-3 py-1 text-[12.5px] text-[#ccc] transition hover:bg-[#2a2a2a]"
+        >
+          <span>📁</span>
+          <span className="max-w-[120px] truncate">
+            {projectPath ? projectPath.split('/').pop() : 'Select Folder'}
+          </span>
+        </button>
+
         <div className="relative" ref={pickerRef}>
           <button
             onClick={() => setPickerOpen((o) => !o)}

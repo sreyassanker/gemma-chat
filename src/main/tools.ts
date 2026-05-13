@@ -26,59 +26,33 @@ export interface ToolSpec {
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 
+const SEARXNG_INSTANCES = [
+  'https://search.sapti.me',
+  'https://searx.be',
+  'https://search.bus-hit.me'
+]
+
 async function webSearch(args: Record<string, unknown>): Promise<string> {
-  const query = String(args.query ?? '').trim()
-  if (!query) return 'Error: missing query'
-  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`
-  const res = await fetch(url, { headers: { 'user-agent': UA, accept: 'text/html' } })
-  if (!res.ok) return `Search failed: ${res.status} ${res.statusText}`
-  const html = await res.text()
-  const results = parseDuckDuckGoResults(html).slice(0, 6)
-  if (results.length === 0) return 'No results found.'
-  return results
-    .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${r.snippet}`)
-    .join('\n\n')
-}
-
-function parseDuckDuckGoResults(
-  html: string
-): Array<{ title: string; url: string; snippet: string }> {
-  const results: Array<{ title: string; url: string; snippet: string }> = []
-  const blockRe = /<div class="result[^"]*?"[^>]*>([\s\S]*?)<div class="clear"/g
-  const titleRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/
-  const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/
-
-  let m: RegExpExecArray | null
-  while ((m = blockRe.exec(html))) {
-    const block = m[1]
-    const t = titleRe.exec(block)
-    const s = snippetRe.exec(block)
-    if (!t) continue
-    const rawUrl = decodeURIComponent(t[1].replace(/^\/\/duckduckgo\.com\/l\/\?uddg=/, ''))
-      .split('&rut=')[0]
-      .split('&amp;')[0]
-    const cleanUrl = rawUrl.split('&')[0]
-    const title = stripTags(t[2]).trim()
-    const snippet = s ? stripTags(s[1]).trim() : ''
-    if (title && cleanUrl.startsWith('http')) {
-      results.push({ title, url: cleanUrl, snippet })
-    }
-    if (results.length >= 10) break
+  const q = String(args.query ?? '').trim()
+  if (!q) return 'Error: missing query'
+  
+  for (const base of SEARXNG_INSTANCES) {
+    try {
+      const res = await fetch(
+        `${base}/search?q=${encodeURIComponent(q)}&format=json&engines=google,bing,duckduckgo,wikipedia&pageno=1`,
+        { headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) }
+      )
+      if (!res.ok) continue
+      
+      const data = await res.json() as { results: Array<{ title: string; url: string; content: string }> }
+      if (!data.results?.length) continue
+      
+      return data.results.slice(0, 8).map((r, i) => 
+        `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.content.slice(0, 200)}`
+      ).join('\n\n')
+    } catch { continue }
   }
-  return results
-}
-
-function stripTags(s: string): string {
-  return s
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/\s+/g, ' ')
-    .trim()
+  return 'Error: All search instances failed. Check internet connection.'
 }
 
 async function fetchUrl(args: Record<string, unknown>): Promise<string> {
@@ -101,10 +75,10 @@ async function fetchUrl(args: Record<string, unknown>): Promise<string> {
 
 function htmlToText(html: string): string {
   return html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<<[^>]+>/g, ' ')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
@@ -262,7 +236,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     description: 'Search the web via DuckDuckGo. Returns a numbered list of results.',
     params: [{ name: 'query', description: 'what to search for', required: true }],
     example:
-      '<action name="web_search">\n<query>latest tensorflow release notes</query>\n</action>',
+      '<action name="web_search">\n<<query>latest tensorflow release notes</query>\n</action>',
     mode: 'both',
     run: webSearch
   },
@@ -270,7 +244,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'fetch_url',
     description: 'Fetch a web page and return its text content (truncated to ~8KB).',
     params: [{ name: 'url', description: 'absolute http(s) URL', required: true }],
-    example: '<action name="fetch_url">\n<url>https://example.com</url>\n</action>',
+    example: '<action name="fetch_url">\n<<url>https://example.com</url>\n</action>',
     mode: 'both',
     run: fetchUrl
   },
@@ -278,7 +252,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'calc',
     description: 'Evaluate a numeric expression.',
     params: [{ name: 'expression', description: 'math expression', required: true }],
-    example: '<action name="calc">\n<expression>2 + 2 * 3</expression>\n</action>',
+    example: '<action name="calc">\n<<expression>2 + 2 * 3</expression>\n</action>',
     mode: 'both',
     run: calc
   },
@@ -291,7 +265,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       { name: 'content', description: 'full file text', required: true, multiline: true }
     ],
     example:
-      '<action name="write_file">\n<path>index.html</path>\n<content>\n<!doctype html>\n<html>\n<body>Hello</body>\n</html>\n</content>\n</action>',
+      '<action name="write_file">\n<<path>index.html</path>\n<<content>\n<!doctype html>\n<html>\n<body>Hello</body>\n</html>\n</content>\n</action>',
     mode: 'code',
     run: writeFile
   },
@@ -299,7 +273,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'read_file',
     description: 'Read a file from the workspace.',
     params: [{ name: 'path', description: 'path relative to workspace', required: true }],
-    example: '<action name="read_file">\n<path>index.html</path>\n</action>',
+    example: '<action name="read_file">\n<<path>index.html</path>\n</action>',
     mode: 'code',
     run: readFile
   },
@@ -314,7 +288,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       { name: 'replace_all', description: 'true to replace every occurrence' }
     ],
     example:
-      '<action name="edit_file">\n<path>index.html</path>\n<old_string>Hello</old_string>\n<new_string>Hello, world</new_string>\n</action>',
+      '<action name="edit_file">\n<<path>index.html</path>\n<<old_string>Hello</old_string>\n<<new_string>Hello, world</new_string>\n</action>',
     mode: 'code',
     run: editFile
   },
@@ -330,7 +304,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'delete_file',
     description: 'Delete a file or directory from the workspace.',
     params: [{ name: 'path', description: 'path to delete', required: true }],
-    example: '<action name="delete_file">\n<path>old.html</path>\n</action>',
+    example: '<action name="delete_file">\n<<path>old.html</path>\n</action>',
     mode: 'code',
     run: deleteFile
   },
@@ -341,7 +315,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     params: [
       { name: 'command', description: 'shell command', required: true, multiline: true }
     ],
-    example: '<action name="run_bash">\n<command>ls -la</command>\n</action>',
+    example: '<action name="run_bash">\n<<command>ls -la</command>\n</action>',
     mode: 'code',
     run: runBash
   },
@@ -513,7 +487,7 @@ export function findNextAction(text: string, from = 0): ParsedAction | 'incomple
   if (!open) return null
   const name = open[1]
   const bodyStart = open.index + open[0].length
-  const closeMatch = text.slice(bodyStart).match(/<\/action\s*>/i)
+  const closeMatch = text.slice(bodyStart).match(/<<\/action\s*>/i)
   if (!closeMatch || closeMatch.index === undefined) return 'incomplete'
   const closeIdx = bodyStart + closeMatch.index
   const body = text.slice(bodyStart, closeIdx)
@@ -544,7 +518,7 @@ function parseActionBody(body: string): Record<string, unknown> {
     }
   }
 
-  const tagRe = /<([a-zA-Z_][\w-]*)>([\s\S]*?)<\/\1>/g
+  const tagRe = /<([a-zA-Z_][\w-]*)>([\s\S]*?)<<\/\1>/g
   let m: RegExpExecArray | null
   while ((m = tagRe.exec(outside)) !== null) {
     const key = m[1]
@@ -569,7 +543,7 @@ export function emitSafeBoundary(buffer: string, from: number): number {
     // Could this be the start of "<action"? If tail is shorter than "<action"
     // we can't be sure yet — hold back.
     if (tail.length < 8) {
-      if ('<action'.startsWith(tail)) return i
+      if ('<<action'.startsWith(tail)) return i
       continue
     }
     if (tail.startsWith('<action') && /\s/.test(tail[7])) return i
