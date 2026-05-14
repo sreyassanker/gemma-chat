@@ -3,7 +3,6 @@ import { runSwarm } from './swarm'
 import { app, shell, BrowserWindow, ipcMain, nativeTheme, session, nativeImage, dialog } from 'electron'
 import { join } from 'path'
 import { existsSync } from 'fs'
-import { mkdir, writeFile, readFile } from 'fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { AVAILABLE_MODELS } from '@shared/types'
 import {
@@ -11,6 +10,8 @@ import {
   installMLX,
   startServer,
   stopServer,
+  hasAnyModelCache,
+  hasCompleteModelCache,
   listLocalModels,
   type MLXChatMessage
 } from './mlx'
@@ -26,13 +27,15 @@ import {
 } from './tools'
 import {
   ensureWorkspace,
+  resolveWorkspaceDir,
   startWorkspaceServer,
   stopWorkspaceServer,
   getWorkspaceServerPort,
   previewUrl,
   listTree,
-  workspaceDir,
-  wsWriteFile
+  wsWriteFile,
+  getCustomWorkspacePath,
+  setCustomWorkspacePath
 } from './workspace'
 import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
 
@@ -84,8 +87,10 @@ function send(channel: string, payload: unknown): void {
 }
 
 let mlxPython: string | null = null
+let activeModel: string | null = null
 
 async function ensureMLXRunning(model: string): Promise<string> {
+  activeModel = model
   let mlx = locateMLX()
   if (!mlx) {
     throw new Error(
@@ -112,10 +117,12 @@ async function ensureMLXRunning(model: string): Promise<string> {
   mlxPython = pythonToUse
 
   const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
-  send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
+  const usingCachedModel = hasCompleteModelCache(model)
   send('setup:status', {
-    stage: 'downloading-model',
-    message: `Loading ${label}… (first run downloads the model)`
+    stage: usingCachedModel ? 'starting-mlx' : 'downloading-model',
+    message: usingCachedModel
+      ? `Loading cached ${label}…`
+      : `Loading ${label}… (first run downloads the model)`
   })
   await startServer(pythonToUse, model, (p) => {
     send('setup:status', {
@@ -256,7 +263,11 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
       }
 
       // Decide: simple local chat or hybrid swarm?
-      const useSwarm = req.enableTools && req.mode === 'chat' && req.messages.length <= 2
+      const useSwarm =
+        process.env.GEMMA_EXPERIMENTAL_SWARM === '1' &&
+        req.enableTools &&
+        req.mode === 'chat' &&
+        req.messages.length <= 2
 
       if (useSwarm && process.env.OPENROUTER_API_KEY) {
         // Hybrid swarm: cloud plans, local executes
@@ -501,6 +512,7 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('model:switch', async (_e, model: string) => {
+    activeModel = model
     const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
     send('setup:status', {
       stage: 'downloading-model',
@@ -530,7 +542,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('setup:status', async () => {
     const mlx = locateMLX()
-    return { hasMLX: !!(mlx && mlx.installed) }
+    return { hasMLX: !!(mlx && mlx.installed), hasAnyModel: hasAnyModelCache() }
   })
 
   ipcMain.handle('models:list-local', async () => {
@@ -557,10 +569,10 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('workspace:info', async (_e, conversationId: string) => {
-    await ensureWorkspace(conversationId)
+    const path = await resolveWorkspaceDir(conversationId)
     return {
       conversationId,
-      path: workspaceDir(conversationId),
+      path,
       previewUrl: previewUrl(conversationId)
     }
   })
@@ -571,8 +583,8 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('workspace:open-external', async (_e, conversationId: string) => {
-    await ensureWorkspace(conversationId)
-    shell.openPath(workspaceDir(conversationId))
+    const path = await resolveWorkspaceDir(conversationId)
+    shell.openPath(path)
   })
 
   ipcMain.handle('workspace:server-port', async () => getWorkspaceServerPort())
@@ -595,25 +607,20 @@ app.whenReady().then(async () => {
     return result.canceled ? null : result.filePaths[0]
   })
 
-  ipcMain.handle('workspace:set-custom-path', async (_e, { conversationId, folderPath }: { conversationId: string; folderPath: string }) => {
-    if (!existsSync(folderPath)) return { error: 'Path does not exist' }
-    
-    const metaDir = join(app.getPath('userData'), 'conversations')
-    await mkdir(metaDir, { recursive: true })
-    const metaPath = join(metaDir, `${conversationId}.json`)
-    await writeFile(metaPath, JSON.stringify({ customPath: folderPath, createdAt: Date.now() }))
-    
-    return { path: folderPath, previewUrl: `http://127.0.0.1:${await getWorkspaceServerPort()}/${conversationId}` }
-  })
+  ipcMain.handle(
+    'workspace:set-custom-path',
+    async (_e, { conversationId, folderPath }: { conversationId: string; folderPath: string }) => {
+      if (!existsSync(folderPath)) return { error: 'Path does not exist' }
+
+      const path = await setCustomWorkspacePath(conversationId, folderPath)
+      send('workspace:changed', { conversationId })
+
+      return { path, previewUrl: previewUrl(conversationId) }
+    }
+  )
 
   ipcMain.handle('workspace:get-custom-path', async (_e, conversationId: string) => {
-    try {
-      const metaPath = join(app.getPath('userData'), 'conversations', `${conversationId}.json`)
-      const data = JSON.parse(await readFile(metaPath, 'utf-8'))
-      return data.customPath || null
-    } catch {
-      return null
-    }
+    return getCustomWorkspacePath(conversationId)
   })
 
   createWindow()
@@ -623,8 +630,8 @@ app.whenReady().then(async () => {
     // Wait for first setup then calibrate
     setTimeout(async () => {
       const mlx = locateMLX()
-      if (mlx?.installed && mlxPython) {
-        await calibrateThermal(mlxPython)
+      if (mlx?.installed && mlxPython && activeModel) {
+        await calibrateThermal(mlxPython, activeModel)
       }
     }, 30000) // 30s after window opens
   })

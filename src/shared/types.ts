@@ -120,5 +120,5 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
   }
 ]
 
-export const DEFAULT_MODEL = 'mlx-community/gemma-4-e4b-it-4bit'
+export const DEFAULT_MODEL = 'mlx-community/gemma-4-e2b-it-4bit'
 

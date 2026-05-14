@@ -23,9 +23,9 @@ function measureTPS(): number {
 }
 
 /** Calibrate baseline on first warm-up */
-export async function calibrateThermal(_python: string): Promise<void> {
+export async function calibrateThermal(_python: string, model: string): Promise<void> {
   const warmup = chatStream({
-    model: 'mlx-community/gemma-4-e2b-it-4bit',
+    model,
     messages: [{ role: 'user', content: 'Say hello' }],
     temperature: 0.1
   })

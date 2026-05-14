@@ -22,6 +22,14 @@ interface Conversation {
 
 const STORAGE_KEY = 'gemma-chat:conversations:v2'
 
+function stripInternalBlocks(content: string): string {
+  return content
+    .replace(/<think(?:ing)?>[\s\S]*?(?:<\/think(?:ing)?>|$)/gi, ' ')
+    .replace(/<observation>[\s\S]*?(?:<\/observation>|$)/gi, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 function loadConversations(): Conversation[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -139,7 +147,7 @@ export default function Chat({ model, onSwitchModel }: Props) {
 
     const history = [...conv.messages, userMsg].map((m) => ({
       role: m.role,
-      content: m.content,
+      content: m.role === 'assistant' ? stripInternalBlocks(m.content) : m.content,
       toolCalls: m.toolCalls
     }))
 
@@ -389,8 +397,10 @@ function Header({
           onClick={async () => {
             const folder = await window.api.selectFolder()
             if (folder) {
-              await window.api.setCustomPath(conversationId, folder)
-              setProjectPath(folder)
+              const result = await window.api.setCustomPath(conversationId, folder)
+              if ('path' in result) {
+                setProjectPath(result.path)
+              }
             }
           }}
           title={projectPath || 'Select project folder'}

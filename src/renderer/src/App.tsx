@@ -3,11 +3,29 @@ import { DEFAULT_MODEL, type SetupStatus } from '@shared/types'
 import Setup from './components/Setup'
 import Chat from './components/Chat'
 
+const MODEL_STORAGE_KEY = 'gemma-chat:selected-model'
+
 type AppState =
   | { phase: 'boot' }
   | { phase: 'setup'; status: SetupStatus; model: string }
   | { phase: 'ready'; model: string }
   | { phase: 'switching'; model: string; toModel: string; status: SetupStatus }
+
+function loadPreferredModel(): string {
+  try {
+    return localStorage.getItem(MODEL_STORAGE_KEY) || DEFAULT_MODEL
+  } catch {
+    return DEFAULT_MODEL
+  }
+}
+
+function savePreferredModel(model: string): void {
+  try {
+    localStorage.setItem(MODEL_STORAGE_KEY, model)
+  } catch {
+    // ignore persistence failures
+  }
+}
 
 export default function App() {
   const [state, setState] = useState<AppState>({ phase: 'boot' })
@@ -20,14 +38,25 @@ export default function App() {
     })
     let unsub: (() => void) | undefined
     ;(async () => {
+      const preferredModel = loadPreferredModel()
+      const cachedModels = await window.api.listLocalModels()
+      const startupModel = cachedModels.includes(DEFAULT_MODEL)
+        ? DEFAULT_MODEL
+        : cachedModels.includes(preferredModel)
+          ? preferredModel
+          : cachedModels[0] || preferredModel
+
       unsub = window.api.onSetupStatus((status) => {
         setState((prev) => {
           if (status.stage === 'ready') {
             // If we were switching, the new model is now ready
             if (prev.phase === 'switching') {
+              savePreferredModel(prev.toModel)
               return { phase: 'ready', model: prev.toModel }
             }
-            return { phase: 'ready', model: prev.phase === 'setup' ? prev.model : DEFAULT_MODEL }
+            const readyModel = prev.phase === 'setup' ? prev.model : startupModel
+            savePreferredModel(readyModel)
+            return { phase: 'ready', model: readyModel }
           }
           if (status.stage === 'error') {
             // If switch failed, go back to the previous model
@@ -39,31 +68,29 @@ export default function App() {
           if (prev.phase === 'switching') {
             return { ...prev, status }
           }
-          const model = prev.phase === 'setup' ? prev.model : DEFAULT_MODEL
+          // If we're already ready, don't jump back to setup phase for minor status updates
+          if (prev.phase === 'ready') {
+            return prev
+          }
+          const model = prev.phase === 'setup' ? prev.model : startupModel
           return { phase: 'setup', status, model }
         })
       })
 
-      const local = await window.api.listLocalModels()
-      const hasDefault = local.some(
-        (m) => m === DEFAULT_MODEL || m.startsWith(DEFAULT_MODEL + ':')
-      )
-      if (hasDefault) {
-        const { hasMLX } = await window.api.checkMLX()
-        if (hasMLX) {
-          setState({
-            phase: 'setup',
-            status: { stage: 'starting-mlx', message: 'Starting model runtime…' },
-            model: DEFAULT_MODEL
-          })
-          window.api.startSetup(DEFAULT_MODEL)
-          return
-        }
+      const { hasMLX } = await window.api.checkMLX()
+      if (hasMLX && cachedModels.length > 0) {
+        setState({
+          phase: 'setup',
+          status: { stage: 'starting-mlx', message: 'Starting model runtime…' },
+          model: startupModel
+        })
+        window.api.startSetup(startupModel)
+        return
       }
       setState({
         phase: 'setup',
         status: { stage: 'checking', message: 'Welcome' },
-        model: DEFAULT_MODEL
+        model: startupModel
       })
     })()
     return () => {
@@ -100,6 +127,7 @@ export default function App() {
             setState((s) => (s.phase === 'setup' ? { ...s, model: m } : s))
           }
           onStart={(model) => {
+            savePreferredModel(model)
             setState({
               phase: 'setup',
               status: { stage: 'checking', message: 'Checking system…' },

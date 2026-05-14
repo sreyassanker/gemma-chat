@@ -1,7 +1,8 @@
 import { app } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
-import { existsSync, rmSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'fs'
+import { AVAILABLE_MODELS } from '@shared/types'
 
 const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -29,6 +30,94 @@ function venvPython(): string {
 
 function modelsDir(): string {
   return join(dataDir(), 'models')
+}
+
+function directoryHasFiles(dir: string, depth = 4): boolean {
+  if (depth < 0) return false
+  try {
+    const entries = readdirSync(dir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue
+      if (entry.isFile()) return true
+      if (entry.isDirectory() && directoryHasFiles(join(dir, entry.name), depth - 1)) {
+        return true
+      }
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+export function hasAnyModelCache(): boolean {
+  return directoryHasFiles(modelsDir())
+}
+
+function cacheRootForModel(model: string): string {
+  const slug = model.replace(/[:/]/g, '--')
+  return join(modelsDir(), 'hub', `models--${slug}`)
+}
+
+function readRefSnapshot(root: string): string | null {
+  try {
+    const ref = readFileSync(join(root, 'refs', 'main'), 'utf-8').trim()
+    return ref || null
+  } catch {
+    return null
+  }
+}
+
+function snapshotDirForModel(model: string): string | null {
+  const root = cacheRootForModel(model)
+  const ref = readRefSnapshot(root)
+  if (!ref) return null
+  const snapshotDir = join(root, 'snapshots', ref)
+  return existsSync(snapshotDir) ? snapshotDir : null
+}
+
+function expectedShardFiles(snapshotDir: string): string[] {
+  const indexPath = join(snapshotDir, 'model.safetensors.index.json')
+  if (!existsSync(indexPath)) {
+    return existsSync(join(snapshotDir, 'model.safetensors')) ? ['model.safetensors'] : []
+  }
+
+  try {
+    const parsed = JSON.parse(readFileSync(indexPath, 'utf-8')) as {
+      weight_map?: Record<string, string>
+    }
+    const shardFiles = Object.values(parsed.weight_map ?? {})
+    if (!shardFiles.length && existsSync(join(snapshotDir, 'model.safetensors'))) {
+      return ['model.safetensors']
+    }
+    return [...new Set(shardFiles)]
+  } catch {
+    return []
+  }
+}
+
+export function hasCompleteModelCache(model: string): boolean {
+  const snapshotDir = snapshotDirForModel(model)
+  if (!snapshotDir) return false
+
+  const expectedFiles = expectedShardFiles(snapshotDir)
+  if (!expectedFiles.length) return false
+
+  const requiredAux = [
+    'config.json',
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'generation_config.json'
+  ]
+
+  for (const file of [...requiredAux, ...expectedFiles]) {
+    if (!existsSync(join(snapshotDir, file))) return false
+  }
+  return true
+}
+
+export function resolveLocalModelPath(model: string): string | null {
+  if (!hasCompleteModelCache(model)) return null
+  return snapshotDirForModel(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -288,11 +377,16 @@ export async function startServer(
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
+  const localModelPath = resolveLocalModelPath(model)
+  const modelArg = localModelPath ?? model
+
+  console.log(
+    `[mlx] Starting server: ${python} -m mlx_lm.server --model ${modelArg} --port ${MLX_PORT}`
+  )
 
   serverProc = spawn(
     python,
-    ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)],
+    ['-m', 'mlx_lm.server', '--model', modelArg, '--port', String(MLX_PORT)],
     {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -351,6 +445,19 @@ export function stopServer(): void {
     serverProc = null
     currentModel = null
   }
+  // Robustly kill anything on our port
+  try {
+    spawnSync('lsof', ['-ti', `:${MLX_PORT}`, '-sTCP:LISTEN'], { stdio: 'pipe' })
+      .stdout?.toString()
+      .split('\n')
+      .filter(Boolean)
+      .forEach((pid) => {
+        console.log(`[mlx] Killing stale process on port ${MLX_PORT}: ${pid}`)
+        spawnSync('kill', ['-9', pid])
+      })
+  } catch {
+    /* ignore lsof failures */
+  }
 }
 
 /**
@@ -392,6 +499,9 @@ async function waitForHealth(
 // ---------------------------------------------------------------------------
 
 export async function listLocalModels(): Promise<string[]> {
+  const cached = AVAILABLE_MODELS.map((m) => m.name).filter((name) => hasCompleteModelCache(name))
+  if (cached.length) return cached
+
   try {
     const res = await fetch(`${MLX_URL}/v1/models`)
     if (!res.ok) return []

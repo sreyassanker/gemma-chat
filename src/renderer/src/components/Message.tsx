@@ -16,20 +16,56 @@ interface Parsed {
   visible: string
 }
 
-function parseThinking(content: string): Parsed {
-  const openRe = /<think(?:ing)?>/
-  const closeRe = /<\/think(?:ing)?>/
-  const openMatch = content.match(openRe)
-  if (!openMatch) return { thinking: '', thinkingInProgress: false, visible: content }
-  const before = content.slice(0, openMatch.index!)
-  const after = content.slice(openMatch.index! + openMatch[0].length)
-  const closeMatch = after.match(closeRe)
-  if (!closeMatch) {
-    return { thinking: after, thinkingInProgress: true, visible: before }
+function formatHiddenBlock(tag: string, raw: string): string {
+  const content = raw.trim()
+  if (!content) return ''
+  if (tag === 'observation') {
+    return `Observation\n${content}`
   }
-  const thinking = after.slice(0, closeMatch.index!)
-  const rest = after.slice(closeMatch.index! + closeMatch[0].length)
-  return { thinking, thinkingInProgress: false, visible: (before + rest).trim() }
+  return content
+}
+
+function parseThinking(content: string): Parsed {
+  const openRe = /<(think(?:ing)?|observation)>/i
+  let visible = ''
+  const hiddenParts: string[] = []
+  let cursor = 0
+  let inProgress = false
+
+  while (cursor < content.length) {
+    const remaining = content.slice(cursor)
+    const openMatch = remaining.match(openRe)
+    if (!openMatch || openMatch.index == null) {
+      visible += remaining
+      break
+    }
+
+    const start = cursor + openMatch.index
+    visible += content.slice(cursor, start)
+
+    const tag = openMatch[1].toLowerCase()
+    const afterStart = start + openMatch[0].length
+    const closeRe = new RegExp(`</${tag}>`, 'i')
+    const closeMatch = content.slice(afterStart).match(closeRe)
+
+    if (!closeMatch || closeMatch.index == null) {
+      const hidden = formatHiddenBlock(tag, content.slice(afterStart))
+      if (hidden) hiddenParts.push(hidden)
+      inProgress = true
+      break
+    }
+
+    const end = afterStart + closeMatch.index
+    const hidden = formatHiddenBlock(tag, content.slice(afterStart, end))
+    if (hidden) hiddenParts.push(hidden)
+    cursor = end + closeMatch[0].length
+  }
+
+  return {
+    thinking: hiddenParts.join('\n\n'),
+    thinkingInProgress: inProgress,
+    visible: visible.trim()
+  }
 }
 
 export default function Message({
@@ -42,7 +78,7 @@ export default function Message({
   const html = useMemo(() => {
     if (!parsed.visible) return ''
     try {
-      return marked.parse(parsed.visible, { async: false, breaks: true }) as string
+      return marked.parse(escapeHtml(parsed.visible), { async: false, breaks: true }) as string
     } catch {
       return escapeHtml(parsed.visible).replace(/\n/g, '<br/>')
     }

@@ -92,7 +92,7 @@ function WelcomeScreen({
   onModelChange: (m: string) => void
   onStart: (model: string) => void
 }) {
-  const selected = AVAILABLE_MODELS.find((m) => m.name === model) ?? AVAILABLE_MODELS[1]
+  const selected = AVAILABLE_MODELS.find((m) => m.name === model) ?? AVAILABLE_MODELS[0]
   return (
     <div className="drag flex h-full w-full flex-col">
       <div className="h-9" />

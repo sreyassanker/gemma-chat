@@ -26,33 +26,327 @@ export interface ToolSpec {
 const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 
-const SEARXNG_INSTANCES = [
+const DEFAULT_SEARXNG_INSTANCES = [
   'https://search.sapti.me',
   'https://searx.be',
-  'https://search.bus-hit.me'
+  'https://search.bus-hit.me',
+  'https://searx.tiekoetter.com',
+  'https://opnxng.com'
 ]
+
+const SEARX_SPACE_BOOTSTRAP_URL = 'https://searx.space/data/instances.json'
+const SEARX_INSTANCE_CACHE_TTL_MS = 15 * 60 * 1000
+const SEARCH_TIMEOUT_MS = 8000
+
+interface SearchHit {
+  title: string
+  url: string
+  snippet: string
+}
+
+let cachedSearxInstances:
+  | {
+      expiresAt: number
+      urls: string[]
+    }
+  | null = null
+
+function normalizeBaseUrl(value: string): string | null {
+  try {
+    const url = new URL(value.trim())
+    if (!/^https?:$/.test(url.protocol)) return null
+    const path = url.pathname.replace(/\/+$/, '')
+    return `${url.origin}${path}`
+  } catch {
+    return null
+  }
+}
+
+function splitInstanceConfig(raw: string): string[] {
+  return raw
+    .split(/[\s,;]+/)
+    .map((value) => normalizeBaseUrl(value))
+    .filter((value): value is string => !!value)
+}
+
+function configuredSearxInstances(): string[] {
+  const raw = process.env.SEARXNG_BASE_URL ?? process.env.SEARXNG_INSTANCES ?? ''
+  return unique(splitInstanceConfig(raw))
+}
+
+function unique(values: string[]): string[] {
+  return [...new Set(values)]
+}
+
+function shuffle<T>(items: T[]): T[] {
+  const out = [...items]
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[out[i], out[j]] = [out[j], out[i]]
+  }
+  return out
+}
+
+function joinSearchEndpoint(base: string, path: string, params: Record<string, string>): string {
+  const root = new URL(base.endsWith('/') ? base : `${base}/`)
+  const url = new URL(path, root)
+  for (const [key, value] of Object.entries(params)) {
+    if (value) url.searchParams.set(key, value)
+  }
+  return url.toString()
+}
+
+function collectPotentialUrls(value: unknown, out: Set<string>): void {
+  if (typeof value === 'string') {
+    const matches = value.match(/https?:\/\/[^\s"'<>]+/g) ?? []
+    for (const match of matches) out.add(match)
+    return
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectPotentialUrls(item, out)
+    return
+  }
+
+  if (value && typeof value === 'object') {
+    for (const [key, item] of Object.entries(value)) {
+      collectPotentialUrls(key, out)
+      collectPotentialUrls(item, out)
+    }
+  }
+}
+
+function isLikelySearxInstance(value: string): boolean {
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase()
+    if (host === 'searx.space' || host === 'docs.searxng.org' || host.includes('github.com')) {
+      return false
+    }
+    return url.pathname === '/' || url.pathname === ''
+  } catch {
+    return false
+  }
+}
+
+async function discoverSearxInstances(): Promise<string[]> {
+  if (cachedSearxInstances && cachedSearxInstances.expiresAt > Date.now()) {
+    return cachedSearxInstances.urls
+  }
+
+  const configured = configuredSearxInstances()
+  const discovered = new Set<string>()
+
+  try {
+    const res = await fetch(SEARX_SPACE_BOOTSTRAP_URL, {
+      headers: { Accept: 'application/json', 'user-agent': UA },
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
+    })
+    if (res.ok) {
+      const data = (await res.json()) as unknown
+      collectPotentialUrls(data, discovered)
+    }
+  } catch {
+    // fall back to defaults below
+  }
+
+  const dynamic = shuffle(
+    unique(
+      [...discovered]
+        .map((value) => normalizeBaseUrl(value))
+        .filter((value): value is string => !!value && isLikelySearxInstance(value))
+    )
+  )
+
+  const urls = unique([...configured, ...dynamic, ...DEFAULT_SEARXNG_INSTANCES])
+  cachedSearxInstances = {
+    urls,
+    expiresAt: Date.now() + SEARX_INSTANCE_CACHE_TTL_MS
+  }
+  return urls
+}
+
+function normalizeResultUrl(rawUrl: string, base: string): string | null {
+  try {
+    const url = new URL(rawUrl, base)
+    const redirectTarget = url.searchParams.get('url')
+    if (
+      redirectTarget &&
+      (url.pathname.includes('/url') || url.pathname.includes('/redirect'))
+    ) {
+      return redirectTarget
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function formatSearchHits(hits: SearchHit[]): string {
+  return hits
+    .slice(0, 8)
+    .map((hit, i) => `${i + 1}. ${hit.title}\n   ${hit.url}\n   ${hit.snippet.slice(0, 200)}`)
+    .join('\n\n')
+}
+
+function dedupeHits(hits: SearchHit[]): SearchHit[] {
+  const seen = new Set<string>()
+  const out: SearchHit[] = []
+  for (const hit of hits) {
+    const key = hit.url.trim()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(hit)
+  }
+  return out
+}
+
+function parseJsonHits(data: unknown, base: string): SearchHit[] {
+  const results = (data as { results?: Array<Record<string, unknown>> })?.results
+  if (!Array.isArray(results)) return []
+
+  return dedupeHits(
+    results
+      .map((result) => {
+        const title = typeof result.title === 'string' ? htmlToText(result.title) : ''
+        const url =
+          typeof result.url === 'string' ? normalizeResultUrl(result.url, base) : null
+        const snippetSource =
+          typeof result.content === 'string'
+            ? result.content
+            : typeof result.snippet === 'string'
+              ? result.snippet
+              : typeof result.pretty_url === 'string'
+                ? result.pretty_url
+                : ''
+        const snippet = htmlToText(snippetSource)
+        if (!title || !url) return null
+        return { title, url, snippet: snippet || 'No snippet available.' }
+      })
+      .filter((hit): hit is SearchHit => !!hit)
+  )
+}
+
+async function searchSearxJson(base: string, q: string): Promise<SearchHit[]> {
+  const url = joinSearchEndpoint(base, 'search', {
+    q,
+    format: 'json',
+    pageno: '1',
+    safesearch: '0'
+  })
+  const res = await fetch(url, {
+    headers: { Accept: 'application/json', 'user-agent': UA },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
+  })
+
+  if (res.status === 403) {
+    throw new Error('json format disabled')
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`)
+  }
+
+  const data = (await res.json()) as unknown
+  const hits = parseJsonHits(data, base)
+  if (!hits.length) {
+    throw new Error('no JSON results')
+  }
+  return hits
+}
+
+function parseHtmlHits(html: string, base: string): SearchHit[] {
+  const blocks =
+    html.match(/<article\b[\s\S]*?<\/article>/gi) ??
+    html.match(/<div\b[^>]*class=(["'])[^"']*\bresult\b[^"']*\1[\s\S]*?<\/div>/gi) ??
+    []
+
+  return dedupeHits(
+    blocks
+      .map((block) => {
+        const anchorMatch =
+          block.match(
+            /<h[1-6][^>]*>[\s\S]*?<a[^>]+href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/i
+          ) ?? block.match(/<a[^>]+href=(["'])(.*?)\1[^>]*>([\s\S]*?)<\/a>/i)
+        if (!anchorMatch) return null
+
+        const url = normalizeResultUrl(anchorMatch[2], base)
+        const title = htmlToText(anchorMatch[3])
+        if (!url || !title) return null
+
+        const snippetMatch =
+          block.match(/<p[^>]*class=(["'])[^"']*\bcontent\b[^"']*\1[^>]*>([\s\S]*?)<\/p>/i) ??
+          block.match(
+            /<div[^>]*class=(["'])[^"']*\b(content|description)\b[^"']*\1[^>]*>([\s\S]*?)<\/div>/i
+          )
+        const snippet = htmlToText(snippetMatch?.[2] ?? snippetMatch?.[3] ?? '')
+
+        return {
+          title,
+          url,
+          snippet: snippet || 'No snippet available.'
+        }
+      })
+      .filter((hit): hit is SearchHit => !!hit)
+  )
+}
+
+async function searchSearxHtml(base: string, q: string): Promise<SearchHit[]> {
+  const url = joinSearchEndpoint(base, 'search', {
+    q,
+    pageno: '1',
+    safesearch: '0',
+    theme: 'simple'
+  })
+  const res = await fetch(url, {
+    headers: { Accept: 'text/html,application/xhtml+xml', 'user-agent': UA },
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
+  })
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`)
+  }
+
+  const html = await res.text()
+  const hits = parseHtmlHits(html, base)
+  if (!hits.length) {
+    throw new Error('no HTML results')
+  }
+  return hits
+}
+
+async function searchSearxInstance(base: string, q: string): Promise<SearchHit[]> {
+  try {
+    return await searchSearxJson(base, q)
+  } catch (jsonError) {
+    try {
+      return await searchSearxHtml(base, q)
+    } catch (htmlError) {
+      const jsonMessage = (jsonError as Error).message
+      const htmlMessage = (htmlError as Error).message
+      throw new Error(`${jsonMessage}; html fallback failed: ${htmlMessage}`)
+    }
+  }
+}
 
 async function webSearch(args: Record<string, unknown>): Promise<string> {
   const q = String(args.query ?? '').trim()
   if (!q) return 'Error: missing query'
-  
-  for (const base of SEARXNG_INSTANCES) {
+
+  const instances = await discoverSearxInstances()
+  const errors: string[] = []
+
+  for (const base of instances) {
     try {
-      const res = await fetch(
-        `${base}/search?q=${encodeURIComponent(q)}&format=json&engines=google,bing,duckduckgo,wikipedia&pageno=1`,
-        { headers: { 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) }
-      )
-      if (!res.ok) continue
-      
-      const data = await res.json() as { results: Array<{ title: string; url: string; content: string }> }
-      if (!data.results?.length) continue
-      
-      return data.results.slice(0, 8).map((r, i) => 
-        `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.content.slice(0, 200)}`
-      ).join('\n\n')
-    } catch { continue }
+      const hits = await searchSearxInstance(base, q)
+      if (hits.length) return formatSearchHits(hits)
+    } catch (e) {
+      errors.push(`${base}: ${(e as Error).message}`)
+    }
   }
-  return 'Error: All search instances failed. Check internet connection.'
+
+  const detail = errors.slice(0, 3).join(' | ')
+  return detail
+    ? `Error: Search unavailable across ${instances.length} SearXNG instance(s). ${detail}`
+    : 'Error: Search unavailable. Check internet connection or configure SEARXNG_BASE_URL.'
 }
 
 async function fetchUrl(args: Record<string, unknown>): Promise<string> {
@@ -75,10 +369,10 @@ async function fetchUrl(args: Record<string, unknown>): Promise<string> {
 
 function htmlToText(html: string): string {
   return html
-    .replace(/<<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<<[^>]+>/g, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&quot;/g, '"')
@@ -233,10 +527,11 @@ async function openPreview(_args: Record<string, unknown>, ctx: ToolContext): Pr
 export const TOOLS: Record<string, ToolSpec> = {
   web_search: {
     name: 'web_search',
-    description: 'Search the web via DuckDuckGo. Returns a numbered list of results.',
+    description:
+      'Search the web via SearXNG with multi-instance fallback. Returns a numbered list of results.',
     params: [{ name: 'query', description: 'what to search for', required: true }],
     example:
-      '<action name="web_search">\n<<query>latest tensorflow release notes</query>\n</action>',
+      '<action name="web_search">\n<query>latest tensorflow release notes</query>\n</action>',
     mode: 'both',
     run: webSearch
   },
@@ -244,7 +539,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'fetch_url',
     description: 'Fetch a web page and return its text content (truncated to ~8KB).',
     params: [{ name: 'url', description: 'absolute http(s) URL', required: true }],
-    example: '<action name="fetch_url">\n<<url>https://example.com</url>\n</action>',
+    example: '<action name="fetch_url">\n<url>https://example.com</url>\n</action>',
     mode: 'both',
     run: fetchUrl
   },
@@ -252,7 +547,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'calc',
     description: 'Evaluate a numeric expression.',
     params: [{ name: 'expression', description: 'math expression', required: true }],
-    example: '<action name="calc">\n<<expression>2 + 2 * 3</expression>\n</action>',
+    example: '<action name="calc">\n<expression>2 + 2 * 3</expression>\n</action>',
     mode: 'both',
     run: calc
   },
@@ -265,7 +560,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       { name: 'content', description: 'full file text', required: true, multiline: true }
     ],
     example:
-      '<action name="write_file">\n<<path>index.html</path>\n<<content>\n<!doctype html>\n<html>\n<body>Hello</body>\n</html>\n</content>\n</action>',
+      '<action name="write_file">\n<path>index.html</path>\n<content>\n<!doctype html>\n<html>\n<body>Hello</body>\n</html>\n</content>\n</action>',
     mode: 'code',
     run: writeFile
   },
@@ -273,7 +568,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'read_file',
     description: 'Read a file from the workspace.',
     params: [{ name: 'path', description: 'path relative to workspace', required: true }],
-    example: '<action name="read_file">\n<<path>index.html</path>\n</action>',
+    example: '<action name="read_file">\n<path>index.html</path>\n</action>',
     mode: 'code',
     run: readFile
   },
@@ -288,7 +583,7 @@ export const TOOLS: Record<string, ToolSpec> = {
       { name: 'replace_all', description: 'true to replace every occurrence' }
     ],
     example:
-      '<action name="edit_file">\n<<path>index.html</path>\n<<old_string>Hello</old_string>\n<<new_string>Hello, world</new_string>\n</action>',
+      '<action name="edit_file">\n<path>index.html</path>\n<old_string>Hello</old_string>\n<new_string>Hello, world</new_string>\n</action>',
     mode: 'code',
     run: editFile
   },
@@ -304,7 +599,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'delete_file',
     description: 'Delete a file or directory from the workspace.',
     params: [{ name: 'path', description: 'path to delete', required: true }],
-    example: '<action name="delete_file">\n<<path>old.html</path>\n</action>',
+    example: '<action name="delete_file">\n<path>old.html</path>\n</action>',
     mode: 'code',
     run: deleteFile
   },
@@ -315,7 +610,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     params: [
       { name: 'command', description: 'shell command', required: true, multiline: true }
     ],
-    example: '<action name="run_bash">\n<<command>ls -la</command>\n</action>',
+    example: '<action name="run_bash">\n<command>ls -la</command>\n</action>',
     mode: 'code',
     run: runBash
   },
@@ -369,12 +664,33 @@ export function chatSystemPrompt(enableTools: boolean): string {
     return [
       "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
       `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
-      'Be clear, concise, and helpful. Use markdown for formatting when useful.'
+      'Be rigorously honest, evidence-first, and constructive.',
+      'Speak with high agency and optimism about solutions, but never fake certainty or soften the truth.',
+      'Think like a world-class interdisciplinary scientist and engineer: precise, skeptical, quantitative, and deeply analytical.',
+      'Clearly separate facts, inference, and speculation.',
+      'Use markdown for formatting when useful.'
     ].join('\n')
   }
   return [
     "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
     `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
+    '',
+    'IDENTITY',
+    '========',
+    '- Tell the truth even when it is inconvenient, unpopular, or disappointing.',
+    '- Be constructively tough-minded: brutal about facts, positive about what can be done next.',
+    '- Think like a top 1% scientist and engineer: rigorous, skeptical, causal, quantitative, and detail-oriented.',
+    '- Maintain broad interdisciplinary knowledge, but never pretend certainty you do not have.',
+    '- Separate observed facts, inferences, assumptions, and speculation whenever that distinction matters.',
+    '',
+    'RESEARCH STANDARD',
+    '=================',
+    '- For every user question or information request, use web_search first before answering.',
+    '- For current events, news, changing facts, products, science, medicine, law, finance, or anything time-sensitive, search first and usually fetch_url the best 1-3 sources before giving the final answer.',
+    '- Do not trust search snippets alone when the answer depends on concrete facts; verify with fetch_url when needed.',
+    '- If the first search results are noisy, low-quality, SEO-heavy, contradictory, or irrelevant, refine the query and search again.',
+    '- If a question includes words like "latest", "today", "right now", or "recent", search using those terms and mention concrete dates in the final answer.',
+    '- If tools fail or evidence is weak, say so plainly instead of bluffing.',
     '',
     'TOOL USE',
     '========',
@@ -389,7 +705,10 @@ export function chatSystemPrompt(enableTools: boolean): string {
     '- One action per response, on its own line.',
     '- Never wrap actions in markdown code fences.',
     '- After writing </action>, STOP. Wait for the result before continuing.',
-    '- When finished, write a short plain-text answer and emit no more actions.',
+    '- After enough evidence is gathered, write the final answer in plain text or markdown and emit no more actions.',
+    '- Never print scratchpad tags such as <observation>, <analysis>, or raw JSON notes in the user-facing reply.',
+    '- If you expose internal reasoning, use <thinking>...</thinking> only. Do not expose tool observations outside that block.',
+    '- Your final answer must be honest, specific, and grounded in the gathered evidence.',
     '',
     'Tools:',
     '',
@@ -425,6 +744,7 @@ export function codeSystemPrompt(workspacePath: string, previewHref: string): st
     '3. After all files are written, call `open_preview`, then write a one-sentence plain-text summary. Emit no further actions.',
     '',
     'CRITICAL: You MUST emit a write_file action in your VERY FIRST response. Never respond with only a plan or description. Always start coding immediately.',
+    'Never print scratchpad tags such as <observation> or <analysis>. Only use <action> blocks for tool calls.',
     '',
     'ACTION FORMAT — EXACT',
     '<action name="tool_name">',
@@ -487,7 +807,7 @@ export function findNextAction(text: string, from = 0): ParsedAction | 'incomple
   if (!open) return null
   const name = open[1]
   const bodyStart = open.index + open[0].length
-  const closeMatch = text.slice(bodyStart).match(/<<\/action\s*>/i)
+  const closeMatch = text.slice(bodyStart).match(/<\/action\s*>/i)
   if (!closeMatch || closeMatch.index === undefined) return 'incomplete'
   const closeIdx = bodyStart + closeMatch.index
   const body = text.slice(bodyStart, closeIdx)
@@ -518,7 +838,7 @@ function parseActionBody(body: string): Record<string, unknown> {
     }
   }
 
-  const tagRe = /<([a-zA-Z_][\w-]*)>([\s\S]*?)<<\/\1>/g
+  const tagRe = /<([a-zA-Z_][\w-]*)>([\s\S]*?)<\/\1>/g
   let m: RegExpExecArray | null
   while ((m = tagRe.exec(outside)) !== null) {
     const key = m[1]
@@ -543,7 +863,7 @@ export function emitSafeBoundary(buffer: string, from: number): number {
     // Could this be the start of "<action"? If tail is shorter than "<action"
     // we can't be sure yet — hold back.
     if (tail.length < 8) {
-      if ('<<action'.startsWith(tail)) return i
+      if ('<action'.startsWith(tail)) return i
       continue
     }
     if (tail.startsWith('<action') && /\s/.test(tail[7])) return i

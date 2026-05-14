@@ -12,18 +12,89 @@ export function workspacesRoot(): string {
   return join(app.getPath('userData'), 'workspaces')
 }
 
+function conversationMetaRoot(): string {
+  return join(app.getPath('userData'), 'conversations')
+}
+
+function workspaceKey(conversationId: string): string {
+  return sanitizeId(conversationId)
+}
+
 export function workspaceDir(conversationId: string): string {
-  return join(workspacesRoot(), sanitizeId(conversationId))
+  return workspaceDirFromKey(workspaceKey(conversationId))
 }
 
 function sanitizeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80) || 'default'
 }
 
-export async function ensureWorkspace(conversationId: string): Promise<string> {
-  const dir = workspaceDir(conversationId)
+function workspaceDirFromKey(key: string): string {
+  return join(workspacesRoot(), key)
+}
+
+function conversationMetaPathFromKey(key: string): string {
+  return join(conversationMetaRoot(), `${key}.json`)
+}
+
+interface ConversationMeta {
+  customPath?: string
+  createdAt?: number
+  updatedAt?: number
+}
+
+async function readConversationMetaByKey(key: string): Promise<ConversationMeta | null> {
+  try {
+    const raw = await readFile(conversationMetaPathFromKey(key), 'utf-8')
+    return JSON.parse(raw) as ConversationMeta
+  } catch {
+    return null
+  }
+}
+
+export async function getCustomWorkspacePath(conversationId: string): Promise<string | null> {
+  const meta = await readConversationMetaByKey(workspaceKey(conversationId))
+  return typeof meta?.customPath === 'string' ? meta.customPath : null
+}
+
+export async function setCustomWorkspacePath(
+  conversationId: string,
+  folderPath: string
+): Promise<string> {
+  const key = workspaceKey(conversationId)
+  const resolved = resolve(folderPath)
+  await mkdir(resolved, { recursive: true })
+  await mkdir(conversationMetaRoot(), { recursive: true })
+  const existing = await readConversationMetaByKey(key)
+  await writeFile(
+    conversationMetaPathFromKey(key),
+    JSON.stringify(
+      {
+        ...existing,
+        customPath: resolved,
+        createdAt: existing?.createdAt ?? Date.now(),
+        updatedAt: Date.now()
+      },
+      null,
+      2
+    ),
+    'utf-8'
+  )
+  return resolved
+}
+
+async function resolveWorkspaceDirFromKey(key: string): Promise<string> {
+  const meta = await readConversationMetaByKey(key)
+  const dir = typeof meta?.customPath === 'string' ? resolve(meta.customPath) : workspaceDirFromKey(key)
   await mkdir(dir, { recursive: true })
   return dir
+}
+
+export async function resolveWorkspaceDir(conversationId: string): Promise<string> {
+  return resolveWorkspaceDirFromKey(workspaceKey(conversationId))
+}
+
+export async function ensureWorkspace(conversationId: string): Promise<string> {
+  return resolveWorkspaceDir(conversationId)
 }
 
 export function assertInWorkspace(base: string, target: string): string {
@@ -88,7 +159,7 @@ export async function startWorkspaceServer(): Promise<number> {
         return
       }
       const id = parts[0]
-      const root = workspaceDir(id)
+      const root = await resolveWorkspaceDirFromKey(id)
       const rel = parts.slice(1).join('/') || ''
       let target: string
       try {
